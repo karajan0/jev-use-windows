@@ -1,0 +1,232 @@
+# Jev Use for Windows
+
+A PowerShell-first Windows desktop control tool for AI agents, powered by
+[Jev](https://docs.typesafe.ai/). It observes a selected application through
+Windows OCR and UI Automation, performs mouse and keyboard actions, and returns
+the result as JSON.
+
+## Requirements
+
+- Windows 10 or Windows 11
+- Python 3.12 or newer
+- An interactive Windows desktop
+- A TypeSafe Jev API key or a Vercel AI Gateway key with Jev access
+
+## Install
+
+Open PowerShell and run:
+
+```powershell
+Set-Location $env:USERPROFILE
+git clone https://github.com/karajan0/jev-use-windows.git
+Set-Location .\jev-use-windows
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\Install-Windows.ps1
+```
+
+The installer creates `.venv` inside the repository and installs the runtime.
+
+## Add an API key
+
+Run:
+
+```powershell
+.\Set-Key.ps1
+```
+
+Choose Vercel AI Gateway or TypeSafe direct, then enter the key in the hidden
+prompt. The key is protected with Windows DPAPI for the current Windows account.
+
+| File | Content |
+| --- | --- |
+| `config\provider.json` | Selected provider name |
+| `config\key.dpapi` | DPAPI-protected API key |
+
+You can use `TYPESAFE_API_KEY` or `AI_GATEWAY_API_KEY` environment variables
+instead. Environment variables take precedence over the saved key.
+
+Check the installation:
+
+```powershell
+.\jev.ps1 doctor
+```
+
+## Install the Codex skill
+
+Run:
+
+```powershell
+.\Install-Skill.ps1
+```
+
+This installs the skill at:
+
+```text
+C:\Users\<your-Windows-user>\.agents\skills\jev-use-windows\SKILL.md
+```
+
+Start a new Codex session if the skill does not appear immediately. You can
+then invoke it directly:
+
+> `$jev-use-windows` Calculate 1283 × 2346 in the open Calculator window.
+
+The repository also contains the skill at
+`.agents\skills\jev-use-windows\SKILL.md`, so Codex can discover it while
+working inside this repository.
+
+## Use from PowerShell
+
+### List visible windows
+
+```powershell
+.\jev.ps1 windows
+```
+
+Each result includes a title, window handle, and screen coordinates. Use a
+unique part of the title with `--window`, or use `#HANDLE` when titles are
+ambiguous.
+
+### Run an adaptive task
+
+```powershell
+.\jev.ps1 run 'Clear the calculator display to 0' --window 'Calculator'
+```
+
+`run` observes the selected window, asks Jev to choose the next action, applies
+the action, and checks the resulting screen. It continues until the goal is
+completed or a stop condition is reached.
+
+Supply exact text or URLs with the command:
+
+```powershell
+.\jev.ps1 run 'Enter the note and save it' `
+  --window 'Notes' `
+  --text 'Exact note' `
+  --field 'Note'
+
+.\jev.ps1 run 'Fill and submit the form' `
+  --window 'Customer form' `
+  --fill 'Name=Alex' `
+  --fill 'City=Seoul'
+
+.\jev.ps1 run 'Open the supplied page' `
+  --window 'Microsoft Edge' `
+  --url 'https://example.com'
+```
+
+### Run a known button sequence
+
+Use `batch` when every button is already visible and its exact label is known:
+
+```powershell
+.\jev.ps1 batch 'Apply and save this record' `
+  --window 'Inventory' `
+  --label 'Apply' `
+  --label 'Save'
+```
+
+Validate the labels before clicking:
+
+```powershell
+.\jev.ps1 batch 'Apply and save this record' `
+  --window 'Inventory' `
+  --label 'Apply' `
+  --label 'Save' `
+  --dry-run
+```
+
+### Inspect a window
+
+```powershell
+.\jev.ps1 inspect --window 'Inventory'
+```
+
+`inspect` returns the text and controls detected through OCR and UI Automation.
+Use it to find the exact window and control labels accepted by other commands.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `doctor` | Check Windows, API key availability, OCR languages, windows, and monitors |
+| `windows` | List visible top-level windows |
+| `inspect` | Read detected text and controls from one window |
+| `run` | Let Jev choose and perform actions until the goal is resolved |
+| `batch` | Click a supplied sequence of exact UI Automation labels and verify the result |
+
+Run command help with:
+
+```powershell
+.\jev.ps1 --help
+.\jev.ps1 run --help
+.\jev.ps1 batch --help
+```
+
+## Result format
+
+Commands print JSON to standard output. A completed task resembles:
+
+```json
+{
+  "status": "completed",
+  "goal": "Save the record",
+  "window": "Inventory",
+  "actions": ["Click ButtonControl 'Save'"],
+  "evidence": "Saved",
+  "jevCalls": 2,
+  "seconds": 1.42
+}
+```
+
+Possible task states include:
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | The current screen contains evidence that the goal was completed |
+| `not_achieved` | Jev stopped without visible completion evidence |
+| `needs_input` | The task requires an exact value that was not supplied |
+| `blocked` | No available action can advance the task |
+| `stalled` | The same action and screen state repeated |
+| `uncertain` | Confidence was too low or an action had an uncertain result |
+| `step_limit` | The configured action limit was reached |
+| `failed` | The task could not start or observation failed |
+
+## How it works
+
+```text
+PowerShell command
+    -> Python worker
+    -> capture selected window
+    -> OCR and UI Automation
+    -> Jev action selection
+    -> Windows mouse or keyboard input
+    -> observe and verify result
+    -> JSON response
+```
+
+OCR and UI Automation run in parallel. Identical captured frames reuse their
+OCR result. `batch` maps controls before the first click and uses one Jev call
+to verify the final screen.
+
+## Desktop support
+
+- Windows 10 and Windows 11
+- Foreground window selection or explicit title/handle selection
+- Negative virtual-desktop coordinates
+- Multiple monitors
+- Connected RDP sessions
+
+Mixed-DPI monitor layouts have not yet been verified. Some GPU-rendered or
+unresponsive applications may not provide a usable `PrintWindow` capture.
+
+## Development
+
+```powershell
+python -m pip install -e . ruff
+python -m ruff check .
+python -m ruff format --check .
+```
+
+## License
+
+[MIT](LICENSE)

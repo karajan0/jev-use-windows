@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e . ruff
+      - run: python -m ruff check .
+      - run: python -m ruff format --check .
+      - run: python -m jev_use.cli --help
+      - name: Validate PowerShell and skill installer
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Filter '*.ps1' | ForEach-Object {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { throw "$($_.Name): $errors" }
+          }
+          $target = Join-Path $env:RUNNER_TEMP 'jev-use-windows-skill'
+          & .\Install-Skill.ps1 -Destination $target
+          if (-not (Test-Path (Join-Path $target 'SKILL.md'))) { throw 'Skill not installed' }

@@ -1,0 +1,49 @@
+[project]
+name = "jev-use-windows"
+version = "0.1.0"
+description = "A small Jev-driven Windows desktop agent with local OCR and a PowerShell CLI."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["jev", "windows", "computer-use", "automation", "powershell"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "typesafe-sdk==0.6.0",
+    "pillow==12.3.0",
+    "uiautomation==2.0.29; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Globalization==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Foundation==3.2.1; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections==3.2.1; sys_platform == 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/karajan0/jev-use-windows"
+Issues = "https://github.com/karajan0/jev-use-windows/issues"
+
+[project.scripts]
+jev-use = "jev_use.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jev_use"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
