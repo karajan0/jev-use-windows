@@ -194,7 +194,7 @@ def desktop_bounds() -> tuple[int, int, int, int]:
 def capture_desktop() -> tuple[tuple[int, int, int, int], Image.Image]:
     """Capture the pixels actually visible across the virtual desktop."""
     bounds = desktop_bounds()
-    image = ImageGrab.grab(all_screens=True).convert("RGB")
+    image = ImageGrab.grab(bbox=bounds, all_screens=True).convert("RGB")
     if image.size != (bounds[2] - bounds[0], bounds[3] - bounds[1]):
         raise RuntimeError("Desktop capture does not match the monitor layout")
     return bounds, image
@@ -227,6 +227,12 @@ def select_window(query: str | None) -> Window:
     for item in listed:
         if item.handle == active:
             return item
+    # Native menus can take focus through a titleless child window.
+    for ancestor in (2, 3):  # GA_ROOT, GA_ROOTOWNER
+        root = int(_user32().GetAncestor(wintypes.HWND(active), ancestor) or 0)
+        for item in listed:
+            if item.handle == root:
+                return item
     raise RuntimeError("No visible foreground window; use --window")
 
 

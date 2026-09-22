@@ -19,7 +19,7 @@ from .desktop import (
     observe_controls,
     observe_desktop,
     read_focused_value,
-    set_combo_value,
+    target_matches,
 )
 
 
@@ -31,6 +31,10 @@ class Action:
     value: str | None = None
 
 
+def _field_name(label: str) -> str:
+    return label.casefold().strip().rstrip(" :\uff1a").strip()
+
+
 def _actions(
     screen: Observation, text: str | None, field: str | None, fills: dict[str, str], url: str | None
 ) -> dict[str, Action]:
@@ -40,15 +44,19 @@ def _actions(
     }
     for index, target in enumerate(screen.targets):
         if target.kind == "text":
-            value = fills.get(target.label.casefold())
-            field_match = bool(field and field.casefold() in target.label.casefold())
+            value = next((item for key, item in fills.items() if _field_name(key) == _field_name(target.label)), None)
+            field_match = bool(field and _field_name(field) in _field_name(target.label))
             if value is None and text is not None and (not field or field_match):
                 value = text
             if value is None:
                 continue
             if target.value and target.value == value:
                 continue
-            if target.value and target.label.casefold() not in fills and not field_match:
+            if (
+                target.value
+                and not any(_field_name(key) == _field_name(target.label) for key in fills)
+                and not field_match
+            ):
                 continue
             actions[f"t{index}"] = Action(
                 "type",
@@ -177,8 +185,13 @@ def _choose(
     choice = answer.choice
     if choice in {"click", "type"}:
         target_answer = response.answers[f"{choice}_target"]
-        choice = target_answer.choice
-        confidence = min(answer.confidence, target_answer.confidence)
+        candidates = clicks if choice == "click" else types
+        if len(candidates) == 1 and target_answer.choice in {*candidates, "none"}:
+            choice = next(iter(candidates))
+            confidence = answer.confidence
+        else:
+            choice = target_answer.choice
+            confidence = min(answer.confidence, target_answer.confidence)
     else:
         confidence = answer.confidence
     return choice, confidence, proof
@@ -196,31 +209,30 @@ def _perform(action: Action, screen: Observation) -> str:
         left, top, right, bottom = screen.window.rect
         if not (left <= x < right and top <= y < bottom):
             raise RuntimeError("The selected target is outside the window")
-        bounds = screen.bounds or screen.window.rect
-        rect = action.target.rect
-        if not (bounds[0] <= rect[0] < rect[2] <= bounds[2] and bounds[1] <= rect[1] < rect[3] <= bounds[3]):
-            raise RuntimeError("The selected target is outside the captured desktop")
-        expected = screen.image.crop(
-            (rect[0] - bounds[0], rect[1] - bounds[1], rect[2] - bounds[0], rect[3] - bounds[1])
-        )
-        current = win32.capture_region(rect)
-        if current.size != expected.size or max(ImageStat.Stat(ImageChops.difference(current, expected)).mean) > 8:
-            raise RuntimeError("The selected target changed after observation; no input was sent")
         if action.kind == "click" and invoke_target(action.target):
             return "unverifiable"
-        if action.kind == "type":
-            direct_value = set_combo_value(action.target, action.value or "")
-            if direct_value is not None:
-                return "field_readback" if direct_value == action.value else "suspected_noop"
+        if not target_matches(action.target):
+            bounds = screen.bounds or screen.window.rect
+            rect = action.target.rect
+            if not (bounds[0] <= rect[0] < rect[2] <= bounds[2] and bounds[1] <= rect[1] < rect[3] <= bounds[3]):
+                raise RuntimeError("The selected target is outside the captured desktop")
+            expected = screen.image.crop(
+                (rect[0] - bounds[0], rect[1] - bounds[1], rect[2] - bounds[0], rect[3] - bounds[1])
+            )
+            current = win32.capture_region(rect)
+            if current.size != expected.size or max(ImageStat.Stat(ImageChops.difference(current, expected)).mean) > 8:
+                raise RuntimeError("The selected target changed after observation; no input was sent")
         win32.click(x, y)
         if action.kind == "type":
             if action.target.value:
                 win32.hotkey(0x11, 0x41)  # Ctrl+A within the explicitly selected field.
             win32.type_text(action.value or "")
-            observed = read_focused_value(action.target)
-            if observed is not None and observed != action.value:
-                time.sleep(0.12)
+            deadline = time.perf_counter() + 0.65
+            while True:
                 observed = read_focused_value(action.target)
+                if observed is None or observed == action.value or time.perf_counter() >= deadline:
+                    break
+                time.sleep(0.04)
             if observed is None:
                 return "unverifiable"
             return "field_readback" if observed == action.value else "suspected_noop"
@@ -260,8 +272,10 @@ def run(
     calls = 0
     prior: tuple[str, str] | None = None
     evidence = None
+    reason = None
     current_window = window
     supplied_fills = dict(fills or {})
+    had_supplied_values = text is not None or bool(supplied_fills) or url is not None
     file_before = _file_state(expected_file) if expected_file else None
     client_options = {"api_key": provider.key, "timeout": 25.0}
     if provider.base_url:
@@ -281,6 +295,12 @@ def run(
             "seconds": round(time.perf_counter() - started, 3),
         }
 
+    def available_actions(screen: Observation) -> dict[str, Action]:
+        found = _actions(screen, text, field, supplied_fills, url)
+        if had_supplied_values:
+            found.pop("needs_input", None)
+        return found
+
     with TypeSafeClient(**client_options) as client:
         try:
             win32.activate(window.handle)
@@ -298,7 +318,12 @@ def run(
                     history[-1] = history[-1].removesuffix("[unverifiable]") + f"[{effect}]"
             except Exception as exc:
                 return failed(exc)
-            actions = _actions(screen, text, field, supplied_fills, url)
+            if expected_visible or expected_file:
+                verified, deterministic_evidence = _postcondition(screen, expected_visible, expected_file, file_before)
+                if verified:
+                    status, evidence = "completed", deterministic_evidence
+                    break
+            actions = available_actions(screen)
             try:
                 choice, confidence, proof = _choose(client, goal, screen, actions, history)
                 calls += 1
@@ -308,13 +333,21 @@ def run(
                     if _snapshot_id(refreshed) != _snapshot_id(screen):
                         screen = refreshed
                         current_window = screen.window
-                        actions = _actions(screen, text, field, supplied_fills, url)
+                        actions = available_actions(screen)
                         choice, confidence, proof = _choose(client, goal, screen, actions, history)
                         calls += 1
+                if choice == "none":
+                    refreshed = observe_desktop(language=language)
+                    screen = refreshed
+                    current_window = screen.window
+                    actions = available_actions(screen)
+                    choice, confidence, proof = _choose(client, goal, screen, actions, history)
+                    calls += 1
             except Exception as exc:
                 return failed(exc)
             if choice not in actions or confidence < min_confidence:
                 status = "uncertain"
+                reason = f"Jev selected {choice!r} with confidence {confidence:.2f}"
                 break
             action = actions[choice]
             if action.kind == "done":
@@ -343,17 +376,31 @@ def run(
             history.append(f"{action.label} [{effect}]")
             if effect == "suspected_noop":
                 status = "uncertain"
+                reason = "The field value did not match the supplied text after input"
                 break
             if action.kind == "type":
                 if text == action.value:
                     text = None
-                supplied_fills.pop(action.target.label.casefold(), None)
+                for key in list(supplied_fills):
+                    if _field_name(key) == _field_name(action.target.label):
+                        supplied_fills.pop(key)
             if action.kind == "url":
                 url = None
             time.sleep(delay)
         else:
             status = "step_limit"
-    return {
+            if expected_visible or expected_file:
+                try:
+                    final = observe_desktop(language=language)
+                    current_window = final.window
+                    verified, deterministic_evidence = _postcondition(
+                        final, expected_visible, expected_file, file_before
+                    )
+                    if verified:
+                        status, evidence = "completed", deterministic_evidence
+                except Exception as exc:
+                    return failed(exc)
+    result = {
         "status": status,
         "goal": goal,
         "window": current_window.title,
@@ -362,6 +409,9 @@ def run(
         "jevCalls": calls,
         "seconds": round(time.perf_counter() - started, 3),
     }
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 def batch(

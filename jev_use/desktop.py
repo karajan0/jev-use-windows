@@ -230,32 +230,9 @@ def read_focused_value(target: Target) -> str | None:
     return None
 
 
-def invoke_target(target: Target) -> bool:
-    """Invoke a matching native control; return False when pixel input is needed."""
-    if target.role not in {"ButtonControl", "HyperlinkControl", "MenuItemControl"}:
-        return False
-    import uiautomation as auto
-    from comtypes import COMError
-
-    try:
-        control = auto.ControlFromPoint(*target.center)
-        if control is None or control.ControlTypeName != target.role:
-            return False
-        if str(control.Name or "").strip()[:160] != target.label:
-            return False
-        pattern = control.GetInvokePattern()
-        if pattern is None:
-            return False
-    except (AttributeError, RuntimeError, OSError, COMError):
-        return False
-    if not pattern.Invoke(waitTime=0):
-        raise RuntimeError("UI Automation could not confirm whether the control was invoked")
-    return True
-
-
-def set_combo_value(target: Target, value: str) -> str | None:
-    """Set an editable combo box directly, or return None for pixel fallback."""
-    if target.role != "ComboBoxControl":
+def _matching_control(target: Target):
+    """Resolve a live UI Automation element at the observed target point."""
+    if target.role == "OCR":
         return None
     import uiautomation as auto
     from comtypes import COMError
@@ -266,18 +243,35 @@ def set_combo_value(target: Target, value: str) -> str | None:
             if control is None:
                 return None
             if control.ControlTypeName == target.role and str(control.Name or "").strip()[:160] == target.label:
-                pattern = control.GetValuePattern()
-                if pattern is None or pattern.IsReadOnly:
-                    return None
-                break
+                return control
             control = control.GetParentControl()
-        else:
-            return None
     except (AttributeError, RuntimeError, OSError, COMError):
         return None
-    if not pattern.SetValue(value, waitTime=0):
-        raise RuntimeError("UI Automation could not confirm whether the field was changed")
-    return str(pattern.Value or "")
+    return None
+
+
+def target_matches(target: Target) -> bool:
+    return _matching_control(target) is not None
+
+
+def invoke_target(target: Target) -> bool:
+    """Invoke a matching native control; return False when pixel input is needed."""
+    if target.role not in {"ButtonControl", "HyperlinkControl", "MenuItemControl"}:
+        return False
+    from comtypes import COMError
+
+    control = _matching_control(target)
+    if control is None:
+        return False
+    try:
+        pattern = control.GetInvokePattern()
+        if pattern is None:
+            return False
+    except (AttributeError, RuntimeError, OSError, COMError):
+        return False
+    if not pattern.Invoke(waitTime=0):
+        raise RuntimeError("UI Automation could not confirm whether the control was invoked")
+    return True
 
 
 def observe_controls(window: win32.Window) -> tuple[win32.Window, list[Target]]:

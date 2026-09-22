@@ -98,7 +98,6 @@ save dialogs become the next observation. Jev chooses each action from the
 current foreground window until the goal is completed or a stop condition is
 reached. It chooses the action kind and a compatible target in one Jev request.
 Editable combo boxes and explicitly named fields can receive supplied text.
-The worker first uses a combo box's native value operation when available.
 After typing, the worker reads the focused field's value when Windows exposes
 it; otherwise it checks the next visible screen state without repeating the
 input automatically.
