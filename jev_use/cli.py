@@ -32,6 +32,8 @@ def parser() -> argparse.ArgumentParser:
         "--fill", action="append", default=[], metavar="LABEL=TEXT", help="repeat for several exact field labels"
     )
     loop.add_argument("--url", help="exact HTTPS URL to open in a browser window")
+    loop.add_argument("--expect-visible", help="exact completion text required outside editable fields")
+    loop.add_argument("--expect-file", type=Path, help="output file that must be created or changed during this run")
     loop.add_argument("--ocr-language", help="installed Windows OCR language tag, such as en-US or ko")
     loop.add_argument("--steps", type=int, default=12)
     loop.add_argument("--min-confidence", type=float, default=0.35)
@@ -99,6 +101,10 @@ def execute(args: argparse.Namespace) -> dict | list[dict]:
             raise ValueError("Use either nonempty --text or --fill")
         if args.url and not args.url.startswith("https://"):
             raise ValueError("--url requires HTTPS")
+        if args.expect_visible is not None and not args.expect_visible.strip():
+            raise ValueError("--expect-visible requires nonempty text")
+        if args.expect_file is not None and not args.expect_file.is_absolute():
+            raise ValueError("--expect-file requires an absolute path")
         return run(
             args.goal,
             win32.select_window(args.window),
@@ -110,6 +116,8 @@ def execute(args: argparse.Namespace) -> dict | list[dict]:
             language=args.ocr_language,
             max_steps=args.steps,
             min_confidence=args.min_confidence,
+            expected_visible=args.expect_visible,
+            expected_file=args.expect_file,
         )
     if not args.goal.strip() or not args.label or any(not item.strip() for item in args.label):
         raise ValueError("A goal and nonempty labels are required")

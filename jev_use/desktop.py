@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from . import ocr, win32
 
@@ -26,22 +25,55 @@ _ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-ocr")
 
 
 class _OcrFrameCache:
-    """Reuse OCR only when the same window has identical captured pixels."""
+    """Reuse unchanged text and reread only horizontal bands that changed."""
 
     def __init__(self) -> None:
         self.key: tuple[int, tuple[int, int, int, int], str | None] | None = None
-        self.digest: bytes | None = None
+        self.image: Image.Image | None = None
         self.words: list[ocr.TextBox] = []
 
     def read(
         self, image: Image.Image, handle: int, rect: tuple[int, int, int, int], language: str | None
     ) -> list[ocr.TextBox]:
         key = (handle, rect, language)
-        digest = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
-        if key == self.key and digest == self.digest:
-            return self.words
-        words = ocr.read(image, language)
-        self.key, self.digest, self.words = key, digest, words
+        if self.key != key or self.image is None or self.image.size != image.size:
+            words = ocr.read(image, language)
+        else:
+            changed = ImageChops.difference(self.image, image)
+            if changed.getbbox() is None:
+                return self.words
+            height = image.height
+            band_height = 128
+            rows = [
+                row
+                for row in range(0, height, band_height)
+                if changed.crop((0, row, image.width, min(row + band_height, height))).getbbox() is not None
+            ]
+            bands: list[tuple[int, int]] = []
+            for row in rows:
+                top, bottom = max(0, row - 32), min(height, row + band_height + 32)
+                if bands and top <= bands[-1][1]:
+                    bands[-1] = (bands[-1][0], max(bands[-1][1], bottom))
+                else:
+                    bands.append((top, bottom))
+            if len(bands) > 3 or sum(bottom - top for top, bottom in bands) > height * 0.55:
+                words = ocr.read(image, language)
+            else:
+                words = [
+                    word
+                    for word in self.words
+                    if all(word.rect[3] <= top or word.rect[1] >= bottom for top, bottom in bands)
+                ]
+                for top, bottom in bands:
+                    crop = image.crop((0, top, image.width, bottom))
+                    words.extend(
+                        ocr.TextBox(
+                            word.text, (word.rect[0], word.rect[1] + top, word.rect[2], word.rect[3] + top), word.line
+                        )
+                        for word in ocr.read(crop, language)
+                    )
+                words.sort(key=lambda word: (word.rect[1], word.rect[0]))
+        self.key, self.image, self.words = key, image.copy(), words
         return words
 
 
@@ -71,6 +103,7 @@ class Observation:
     text: list[str]
     ocr_lines: list[str] = field(default_factory=list)
     bounds: tuple[int, int, int, int] | None = None
+    postcondition_text: list[str] = field(default_factory=list)
 
 
 def _inside(rect: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:
@@ -81,6 +114,40 @@ def _inside(rect: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -
         and outer[0] <= (left + right) // 2 < outer[2]
         and outer[1] <= (top + bottom) // 2 < outer[3]
     )
+
+
+def _visual_phrases(words: list[ocr.TextBox]) -> list[str]:
+    """Join nearby OCR words even when the OCR engine splits one visible row."""
+    rows: list[list[ocr.TextBox]] = []
+    for word in sorted(words, key=lambda item: ((item.rect[1] + item.rect[3]) // 2, item.rect[0])):
+        center = (word.rect[1] + word.rect[3]) // 2
+        height = word.rect[3] - word.rect[1]
+        row = next(
+            (
+                item
+                for item in reversed(rows[-4:])
+                if abs(center - (item[0].rect[1] + item[0].rect[3]) // 2)
+                <= max(6, min(height, item[0].rect[3] - item[0].rect[1]) * 0.6)
+            ),
+            None,
+        )
+        if row is None:
+            rows.append([word])
+        else:
+            row.append(word)
+    phrases: list[str] = []
+    for row in rows:
+        group: list[ocr.TextBox] = []
+        for word in sorted(row, key=lambda item: item.rect[0]):
+            if group and word.rect[0] - group[-1].rect[2] > max(
+                24, 2 * max(word.rect[3] - word.rect[1], group[-1].rect[3] - group[-1].rect[1])
+            ):
+                phrases.append(" ".join(item.text for item in group))
+                group = []
+            group.append(word)
+        if group:
+            phrases.append(" ".join(item.text for item in group))
+    return list(dict.fromkeys(phrases))
 
 
 def _uia_targets(handle: int, window_rect: tuple[int, int, int, int]) -> tuple[list[Target], list[str]]:
@@ -248,7 +315,15 @@ def _finish_observation(
             targets.append(Target("click", word.text, box, "OCR"))
     lines = list(dict.fromkeys(word.line or word.text for word in [*uncovered, *covered_words]))
     text = list(dict.fromkeys([window.title, *names, *lines]))[:150]
-    return Observation(window, image, targets[:140], text, lines, bounds)
+    editable = [target.rect for target in uia if target.kind == "text"]
+
+    def in_edit(word: ocr.TextBox) -> bool:
+        x = left + (word.rect[0] + word.rect[2]) // 2
+        y = top + (word.rect[1] + word.rect[3]) // 2
+        return any(rect[0] <= x < rect[2] and rect[1] <= y < rect[3] for rect in editable)
+
+    postcondition_text = _visual_phrases([word for word in words if not in_edit(word)])[:150]
+    return Observation(window, image, targets[:140], text, lines, bounds, postcondition_text)
 
 
 def observe(window: win32.Window, *, language: str | None = None) -> Observation:

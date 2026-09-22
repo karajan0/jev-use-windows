@@ -121,6 +121,26 @@ Supply exact text or URLs with the command:
   --url 'https://example.com'
 ```
 
+For a task with a known completion signal, require it before returning
+`completed`:
+
+```powershell
+.\jev.ps1 run 'Save the report as Report.hwp' `
+  --window 'Hancom Office' `
+  --fill 'File name=Report.hwp' `
+  --expect-file "$env:USERPROFILE\Documents\Report.hwp"
+
+.\jev.ps1 run 'Submit the form' `
+  --window 'Customer form' `
+  --fill 'Name=Alex' `
+  --expect-visible 'Saved: Alex'
+```
+
+`--expect-file` requires a file to be created or changed during the run.
+`--expect-visible` matches one OCR line or nearby phrase outside editable
+fields, so a draft value alone cannot satisfy it. Both conditions must pass
+when both are supplied.
+
 ### Run a known button sequence
 
 Use `batch` when every button is already visible and its exact label is known:
@@ -190,7 +210,7 @@ Possible task states include:
 | Status | Meaning |
 | --- | --- |
 | `completed` | The current screen contains evidence that the goal was completed |
-| `not_achieved` | Jev stopped without visible completion evidence |
+| `not_achieved` | Completion evidence or a supplied completion condition was missing |
 | `needs_input` | The task requires an exact value that was not supplied |
 | `blocked` | No available action can advance the task |
 | `stalled` | The same action and screen state repeated |
@@ -211,10 +231,12 @@ PowerShell command
     -> JSON response
 ```
 
-OCR and UI Automation run in parallel. Identical foreground captures reuse
-their OCR result. Jev receives text and action choices; desktop images stay
+OCR and UI Automation run in parallel. Unchanged regions reuse their OCR
+result; changed screen bands are read again. Jev receives text and action
+choices; desktop images stay
 local. Native buttons use UI Automation invocation when available, with a
-screen-coordinate click fallback. Action history marks matching field readback
+screen-coordinate click fallback. Before acting, the worker checks that the
+target still looks like the observed screen. Action history marks matching field readback
 as `field_readback`, a visible screen change as `visual_change`, and an action with
 no visible change as `suspected_noop`; a screen change alone does not prove
 task completion. `batch` maps controls before the first click and uses one Jev

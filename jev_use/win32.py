@@ -200,6 +200,13 @@ def capture_desktop() -> tuple[tuple[int, int, int, int], Image.Image]:
     return bounds, image
 
 
+def capture_region(rect: tuple[int, int, int, int]) -> Image.Image:
+    """Read a small live desktop region just before an action."""
+    if rect[2] <= rect[0] or rect[3] <= rect[1]:
+        raise ValueError("The capture region is empty")
+    return ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+
+
 def select_window(query: str | None) -> Window:
     listed = windows()
     if query:

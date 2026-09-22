@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
+from PIL import ImageChops, ImageStat
 from typesafe_sdk import Choice, TypeSafeClient
 
 from . import win32
@@ -69,7 +71,7 @@ def _actions(
 
 
 def _evidence(screen: Observation) -> dict[str, str]:
-    candidates = list(dict.fromkeys([*screen.text[:60], *screen.ocr_lines[:20]]))[:80]
+    candidates = list(dict.fromkeys([*screen.postcondition_text[:60], *screen.text[:60], *screen.ocr_lines[:20]]))[:80]
     return {"none": "No visible text proves the goal."} | {
         f"p{index}": item[:180] for index, item in enumerate(candidates)
     }
@@ -79,6 +81,36 @@ def _visible_text(screen: Observation) -> list[str]:
     # A dense UIA tree can put a visual-only status past the state limit.
     # OCR lines are ordered with text outside UIA controls first.
     return list(dict.fromkeys([*screen.ocr_lines[:24], *screen.text]))[:120]
+
+
+def _file_state(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    if not path.is_file():
+        raise ValueError("The expected output path is not a file")
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+def _postcondition(
+    screen: Observation, expected_visible: str | None, expected_file: Path | None, file_before: tuple[int, int] | None
+) -> tuple[bool, str | None]:
+    proof: list[str] = []
+    if expected_visible:
+        required = " ".join(expected_visible.casefold().split())
+        match = next(
+            (line for line in screen.postcondition_text if " ".join(line.casefold().split()) == required), None
+        )
+        if match is None:
+            return False, None
+        proof.append(f"Visible outside editable fields: {match}")
+    if expected_file:
+        after = _file_state(expected_file)
+        if after is None or after == file_before:
+            return False, None
+        proof.append(f"Output file created or changed: {expected_file}")
+    return True, "; ".join(proof) if proof else None
 
 
 def _snapshot_id(screen: Observation) -> str:
@@ -164,6 +196,16 @@ def _perform(action: Action, screen: Observation) -> str:
         left, top, right, bottom = screen.window.rect
         if not (left <= x < right and top <= y < bottom):
             raise RuntimeError("The selected target is outside the window")
+        bounds = screen.bounds or screen.window.rect
+        rect = action.target.rect
+        if not (bounds[0] <= rect[0] < rect[2] <= bounds[2] and bounds[1] <= rect[1] < rect[3] <= bounds[3]):
+            raise RuntimeError("The selected target is outside the captured desktop")
+        expected = screen.image.crop(
+            (rect[0] - bounds[0], rect[1] - bounds[1], rect[2] - bounds[0], rect[3] - bounds[1])
+        )
+        current = win32.capture_region(rect)
+        if current.size != expected.size or max(ImageStat.Stat(ImageChops.difference(current, expected)).mean) > 8:
+            raise RuntimeError("The selected target changed after observation; no input was sent")
         if action.kind == "click" and invoke_target(action.target):
             return "unverifiable"
         if action.kind == "type":
@@ -210,6 +252,8 @@ def run(
     max_steps: int = 12,
     min_confidence: float = 0.35,
     delay: float = 0.08,
+    expected_visible: str | None = None,
+    expected_file: Path | None = None,
 ) -> dict:
     started = time.perf_counter()
     history: list[str] = []
@@ -218,6 +262,7 @@ def run(
     evidence = None
     current_window = window
     supplied_fills = dict(fills or {})
+    file_before = _file_state(expected_file) if expected_file else None
     client_options = {"api_key": provider.key, "timeout": 25.0}
     if provider.base_url:
         client_options["base_url"] = provider.base_url
@@ -274,7 +319,14 @@ def run(
             action = actions[choice]
             if action.kind == "done":
                 evidence = _evidence(screen).get(proof) if proof != "none" else None
-                status = "completed" if proof != "none" and evidence else "not_achieved"
+                if expected_visible or expected_file:
+                    verified, deterministic_evidence = _postcondition(
+                        screen, expected_visible, expected_file, file_before
+                    )
+                    status = "completed" if verified else "not_achieved"
+                    evidence = deterministic_evidence if verified else None
+                else:
+                    status = "completed" if proof != "none" and evidence else "not_achieved"
                 break
             if action.kind in {"needs_input", "blocked"}:
                 status = action.kind

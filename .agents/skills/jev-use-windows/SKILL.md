@@ -25,6 +25,9 @@ Omit `--window` to use the foreground window. If titles are ambiguous, call
 `windows` once and pass `--window '#HANDLE'`. Supply exact user-authorized
 text with `--text 'TEXT'` and optionally `--field 'FIELD'`, or repeat
 `--fill 'LABEL=TEXT'`. Supply a needed HTTPS URL with `--url 'https://...'`.
+When a task has a concrete completion signal, pass `--expect-visible 'TEXT'`
+for an exact OCR phrase displayed outside editable fields or `--expect-file 'PATH'` for a
+file that must be created or changed during the run. Both can be combined.
 Jev never invents text or URLs. `--window` selects only the starting window.
 The worker captures the live desktop, reads OCR and UI Automation from the
 current foreground window, asks Jev for the next action, and follows new
