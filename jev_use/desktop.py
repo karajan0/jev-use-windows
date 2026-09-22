@@ -1,4 +1,4 @@
-"""Turn one selected window into compact, local text and action targets."""
+"""Turn the visible desktop and its foreground window into local action targets."""
 
 from __future__ import annotations
 
@@ -69,6 +69,7 @@ class Observation:
     targets: list[Target]
     text: list[str]
     ocr_lines: list[str] = field(default_factory=list)
+    bounds: tuple[int, int, int, int] | None = None
 
 
 def _inside(rect: tuple[int, int, int, int], outer: tuple[int, int, int, int]) -> bool:
@@ -133,29 +134,61 @@ def observe_controls(window: win32.Window) -> tuple[win32.Window, list[Target]]:
     return current, targets
 
 
-def observe(window: win32.Window, *, language: str | None = None) -> Observation:
-    rect = win32.rect_of(window.handle)
-    current = win32.Window(window.handle, window.title, rect)
-    image = win32.capture_window(window.handle, rect)
-    pending_ocr = _ocr_pool.submit(_ocr_cache.read, image, window.handle, rect, language)
-    uia, names = _uia_targets(window.handle, rect)
+def _finish_observation(
+    window: win32.Window,
+    image: Image.Image,
+    ocr_image: Image.Image,
+    ocr_rect: tuple[int, int, int, int],
+    bounds: tuple[int, int, int, int],
+    language: str | None,
+) -> Observation:
+    pending_ocr = _ocr_pool.submit(_ocr_cache.read, ocr_image, window.handle, ocr_rect, language)
+    uia, names = _uia_targets(window.handle, window.rect)
     words = pending_ocr.result()
-    left, top = rect[:2]
-    targets = list(uia)
+    left, top = ocr_rect[:2]
 
     def covered(word: ocr.TextBox) -> bool:
         x = left + (word.rect[0] + word.rect[2]) // 2
         y = top + (word.rect[1] + word.rect[3]) // 2
         return any(box.rect[0] <= x < box.rect[2] and box.rect[1] <= y < box.rect[3] for box in uia)
 
-    uncovered_words: list[ocr.TextBox] = []
-    covered_words: list[ocr.TextBox] = []
-    for word in words:
-        (covered_words if covered(word) else uncovered_words).append(word)
-    for word in [*uncovered_words, *covered_words][:70]:
-        box = tuple((value + (left if index % 2 == 0 else top)) for index, value in enumerate(word.rect))
-        if _inside(box, rect):
+    uncovered = [word for word in words if not covered(word)]
+    covered_words = [word for word in words if covered(word)]
+    targets = list(uia)
+    for word in [*uncovered, *covered_words][:70]:
+        box = (left + word.rect[0], top + word.rect[1], left + word.rect[2], top + word.rect[3])
+        if _inside(box, window.rect):
             targets.append(Target("click", word.text, box, "OCR"))
-    lines = list(dict.fromkeys(word.line or word.text for word in [*uncovered_words, *covered_words]))
-    text = list(dict.fromkeys([*names, *lines]))[:150]
-    return Observation(current, image, targets[:140], text, lines)
+    lines = list(dict.fromkeys(word.line or word.text for word in [*uncovered, *covered_words]))
+    text = list(dict.fromkeys([window.title, *names, *lines]))[:150]
+    return Observation(window, image, targets[:140], text, lines, bounds)
+
+
+def observe(window: win32.Window, *, language: str | None = None) -> Observation:
+    rect = win32.rect_of(window.handle)
+    current = win32.Window(window.handle, window.title, rect)
+    image = win32.capture_window(window.handle, rect)
+    return _finish_observation(current, image, image, rect, rect, language)
+
+
+def observe_desktop(*, language: str | None = None) -> Observation:
+    """Read pixels from the live desktop and controls from its current foreground window."""
+    for _ in range(2):
+        before = win32.select_window(None)
+        bounds, image = win32.capture_desktop()
+        foreground = win32.select_window(None)
+        if before.handle == foreground.handle:
+            break
+    else:
+        raise RuntimeError("The foreground window changed during capture")
+
+    crop = (
+        max(bounds[0], foreground.rect[0]),
+        max(bounds[1], foreground.rect[1]),
+        min(bounds[2], foreground.rect[2]),
+        min(bounds[3], foreground.rect[3]),
+    )
+    if crop[2] <= crop[0] or crop[3] <= crop[1]:
+        raise RuntimeError("The foreground window is outside the desktop")
+    foreground_image = image.crop((crop[0] - bounds[0], crop[1] - bounds[1], crop[2] - bounds[0], crop[3] - bounds[1]))
+    return _finish_observation(foreground, image, foreground_image, crop, bounds, language)

@@ -1,9 +1,9 @@
 # Jev Use for Windows
 
 A PowerShell-first Windows desktop control tool for AI agents, powered by
-[Jev](https://docs.typesafe.ai/). It observes a selected application through
-Windows OCR and UI Automation, performs mouse and keyboard actions, and returns
-the result as JSON.
+[Jev](https://docs.typesafe.ai/). It captures the live Windows desktop, reads
+the current foreground window through OCR and UI Automation, performs mouse
+and keyboard actions, and returns the result as JSON.
 
 ## Requirements
 
@@ -92,9 +92,11 @@ ambiguous.
 .\jev.ps1 run 'Clear the calculator display to 0' --window 'Calculator'
 ```
 
-`run` observes the selected window, asks Jev to choose the next action, applies
-the action, and checks the resulting screen. It continues until the goal is
-completed or a stop condition is reached.
+`run` brings the selected window forward once, then captures the live desktop
+and follows whichever window is in front after each action. New app windows and
+save dialogs become the next observation. Jev chooses each action from the
+current foreground window until the goal is completed or a stop condition is
+reached.
 
 Supply exact text or URLs with the command:
 
@@ -196,28 +198,30 @@ Possible task states include:
 ```text
 PowerShell command
     -> Python worker
-    -> capture selected window
-    -> OCR and UI Automation
+    -> capture the visible desktop
+    -> OCR the current foreground window and read its UI Automation controls
     -> Jev action selection
     -> Windows mouse or keyboard input
-    -> observe and verify result
+    -> find the new foreground window and verify the result
     -> JSON response
 ```
 
-OCR and UI Automation run in parallel. Identical captured frames reuse their
-OCR result. `batch` maps controls before the first click and uses one Jev call
-to verify the final screen.
+OCR and UI Automation run in parallel. Identical foreground captures reuse
+their OCR result. Jev receives text and action choices; desktop images stay
+local. `batch` maps controls before the first click and uses one Jev call to
+verify the final screen.
 
 ## Desktop support
 
 - Windows 10 and Windows 11
-- Foreground window selection or explicit title/handle selection
+- Foreground window tracking after an explicit title/handle selection
 - Negative virtual-desktop coordinates
 - Multiple monitors
 - Connected RDP sessions
 
-Mixed-DPI monitor layouts have not yet been verified. Some GPU-rendered or
-unresponsive applications may not provide a usable `PrintWindow` capture.
+Mixed-DPI monitor layouts have not yet been verified. `inspect` and `batch`
+still use a selected-window capture, which some GPU-rendered applications may
+not provide reliably.
 
 ## Development
 

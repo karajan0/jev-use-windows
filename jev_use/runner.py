@@ -10,7 +10,7 @@ from typesafe_sdk import Choice, TypeSafeClient
 
 from . import win32
 from .credentials import Provider
-from .desktop import Observation, Target, observe, observe_controls
+from .desktop import Observation, Target, observe_controls, observe_desktop
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,6 @@ def _actions(
 ) -> dict[str, Action]:
     actions = {
         "done": Action("done", "The CURRENT screen visibly proves the entire goal is complete."),
-        "needs_input": Action("needs_input", "An exact text or URL value is needed but was not supplied."),
         "blocked": Action("blocked", "No safe visible action can advance the goal."),
     }
     for index, target in enumerate(screen.targets):
@@ -49,6 +48,8 @@ def _actions(
     actions["scroll_up"] = Action("scroll", "Scroll up in the selected window", value="up")
     if url:
         actions["open_url"] = Action("url", f"Open the supplied HTTPS URL: {url}", value=url)
+    if text is None and not fills and not url:
+        actions["needs_input"] = Action("needs_input", "An exact text or URL value is needed but was not supplied.")
     return actions
 
 
@@ -66,7 +67,16 @@ def _visible_text(screen: Observation) -> list[str]:
 
 
 def _snapshot_id(screen: Observation) -> str:
-    return hashlib.blake2s(screen.image.convert("L").resize((32, 32)).tobytes(), digest_size=8).hexdigest()
+    bounds = screen.bounds or screen.window.rect
+    rect = screen.window.rect
+    crop = (
+        max(bounds[0], rect[0]) - bounds[0],
+        max(bounds[1], rect[1]) - bounds[1],
+        min(bounds[2], rect[2]) - bounds[0],
+        min(bounds[3], rect[3]) - bounds[1],
+    )
+    pixels = screen.image.crop(crop).convert("L").resize((64, 64)).tobytes()
+    return hashlib.blake2s(screen.window.handle.to_bytes(8, "little") + pixels, digest_size=8).hexdigest()
 
 
 def _choose(
@@ -100,9 +110,10 @@ def _choose(
 
 
 def _perform(action: Action, screen: Observation) -> None:
+    if win32.select_window(None).handle != screen.window.handle:
+        raise RuntimeError("The foreground window changed after observation; no input was sent")
     if win32.rect_of(screen.window.handle) != screen.window.rect:
-        raise RuntimeError("The selected window moved after observation; no input was sent")
-    win32.activate(screen.window.handle)
+        raise RuntimeError("The foreground window moved after observation; no input was sent")
     if action.kind in {"click", "type"}:
         if action.target is None:
             raise RuntimeError("No target for the selected action")
@@ -144,6 +155,7 @@ def run(
     calls = 0
     prior: tuple[str, str] | None = None
     evidence = None
+    current_window = window
     supplied_fills = dict(fills or {})
     client_options = {"api_key": provider.key, "timeout": 25.0}
     if provider.base_url:
@@ -156,7 +168,7 @@ def run(
             "status": "uncertain" if history or attempted else "failed",
             "error": str(exc),
             "goal": goal,
-            "window": window.title,
+            "window": current_window.title,
             "actions": history,
             "attempted": attempted,
             "jevCalls": calls,
@@ -164,12 +176,17 @@ def run(
         }
 
     with TypeSafeClient(**client_options) as client:
+        try:
+            win32.activate(window.handle)
+        except Exception as exc:
+            return failed(exc)
         for _step in range(max_steps):
             try:
-                screen = observe(window, language=language)
+                screen = observe_desktop(language=language)
                 if prior is not None and _snapshot_id(screen) == prior[1]:
                     time.sleep(0.18)
-                    screen = observe(window, language=language)
+                    screen = observe_desktop(language=language)
+                current_window = screen.window
             except Exception as exc:
                 return failed(exc)
             actions = _actions(screen, text, field, supplied_fills, url)
@@ -178,9 +195,10 @@ def run(
                 calls += 1
                 if confidence < min_confidence:
                     time.sleep(0.18)
-                    refreshed = observe(window, language=language)
+                    refreshed = observe_desktop(language=language)
                     if _snapshot_id(refreshed) != _snapshot_id(screen):
                         screen = refreshed
+                        current_window = screen.window
                         actions = _actions(screen, text, field, supplied_fills, url)
                         choice, confidence, proof = _choose(client, goal, screen, actions, history)
                         calls += 1
@@ -219,7 +237,7 @@ def run(
     return {
         "status": status,
         "goal": goal,
-        "window": window.title,
+        "window": current_window.title,
         "actions": history,
         "evidence": evidence,
         "jevCalls": calls,
@@ -255,6 +273,8 @@ def batch(
     win32.activate(window.handle)
     clicked: list[str] = []
     for label, target in zip(labels, mapped, strict=True):
+        if win32.select_window(None).handle != window.handle:
+            return {"status": "stopped", "error": "The foreground window changed during the batch", "clicked": clicked}
         if win32.rect_of(window.handle) != current.rect:
             return {"status": "stopped", "error": "The window moved during the batch", "clicked": clicked}
         try:
@@ -264,7 +284,7 @@ def batch(
         clicked.append(label)
         time.sleep(delay)
     try:
-        final = observe(window)
+        final = observe_desktop()
     except Exception as exc:
         return {"status": "uncertain", "error": str(exc), "clicked": clicked}
     options = {"api_key": provider.key, "timeout": 25.0}

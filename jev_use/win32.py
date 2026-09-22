@@ -10,7 +10,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
 
-from PIL import Image
+from PIL import Image, ImageGrab
 
 
 @dataclass(frozen=True)
@@ -177,6 +177,27 @@ def monitors() -> list[tuple[int, int, int, int]]:
     callback = callback_type(visit)
     _user32().EnumDisplayMonitors(None, None, callback, 0)
     return found
+
+
+def desktop_bounds() -> tuple[int, int, int, int]:
+    displays = monitors()
+    if not displays:
+        raise RuntimeError("No desktop monitors are available")
+    return (
+        min(rect[0] for rect in displays),
+        min(rect[1] for rect in displays),
+        max(rect[2] for rect in displays),
+        max(rect[3] for rect in displays),
+    )
+
+
+def capture_desktop() -> tuple[tuple[int, int, int, int], Image.Image]:
+    """Capture the pixels actually visible across the virtual desktop."""
+    bounds = desktop_bounds()
+    image = ImageGrab.grab(all_screens=True).convert("RGB")
+    if image.size != (bounds[2] - bounds[0], bounds[3] - bounds[1]):
+        raise RuntimeError("Desktop capture does not match the monitor layout")
+    return bounds, image
 
 
 def select_window(query: str | None) -> Window:
