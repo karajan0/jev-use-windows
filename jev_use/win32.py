@@ -267,17 +267,47 @@ def hotkey(modifier: int, key: int) -> None:
 
 
 def type_text(value: str) -> None:
+    """Paste exact Unicode text; synthetic character keys can corrupt Hangul in some editors."""
     if not value:
         raise ValueError("Text must not be empty")
-    encoded = value.encode("utf-16-le")
-    units = [int.from_bytes(encoded[index : index + 2], "little") for index in range(0, len(encoded), 2)]
-    for start in range(0, len(units), 128):
-        events = [
-            event
-            for unit in units[start : start + 128]
-            for event in (_key(unit, unicode=True), _key(unit, up=True, unicode=True))
-        ]
-        _send(events)
+    payload = value.encode("utf-16-le") + b"\0\0"
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32 = _user32()
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    handle = kernel32.GlobalAlloc(0x0002, len(payload))  # GMEM_MOVEABLE
+    if not handle:
+        raise RuntimeError("Could not allocate clipboard text")
+    try:
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise RuntimeError("Could not lock clipboard text")
+        ctypes.memmove(pointer, payload, len(payload))
+        kernel32.GlobalUnlock(handle)
+        for _ in range(10):
+            if user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            raise RuntimeError("Could not open the clipboard")
+        try:
+            if not user32.EmptyClipboard() or not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
+                raise RuntimeError("Could not set clipboard text")
+            handle = None  # The clipboard now owns the memory.
+        finally:
+            user32.CloseClipboard()
+    finally:
+        if handle:
+            kernel32.GlobalFree(handle)
+    hotkey(0x11, 0x56)  # Ctrl+V
 
 
 def click(x: int, y: int) -> None:
