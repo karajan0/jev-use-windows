@@ -96,7 +96,12 @@ ambiguous.
 and follows whichever window is in front after each action. New app windows and
 save dialogs become the next observation. Jev chooses each action from the
 current foreground window until the goal is completed or a stop condition is
-reached.
+reached. It chooses the action kind and a compatible target in one Jev request.
+Editable combo boxes and explicitly named fields can receive supplied text.
+The worker first uses a combo box's native value operation when available.
+After typing, the worker reads the focused field's value when Windows exposes
+it; otherwise it checks the next visible screen state without repeating the
+input automatically.
 
 Supply exact text or URLs with the command:
 
@@ -208,8 +213,12 @@ PowerShell command
 
 OCR and UI Automation run in parallel. Identical foreground captures reuse
 their OCR result. Jev receives text and action choices; desktop images stay
-local. `batch` maps controls before the first click and uses one Jev call to
-verify the final screen.
+local. Native buttons use UI Automation invocation when available, with a
+screen-coordinate click fallback. Action history marks matching field readback
+as `field_readback`, a visible screen change as `visual_change`, and an action with
+no visible change as `suspected_noop`; a screen change alone does not prove
+task completion. `batch` maps controls before the first click and uses one Jev
+call to verify the final screen.
 
 ## Desktop support
 

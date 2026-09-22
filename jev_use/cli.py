@@ -26,7 +26,7 @@ def parser() -> argparse.ArgumentParser:
     loop = sub.add_parser("run", help="let Jev observe and act until the goal is verified or the limit is reached")
     loop.add_argument("goal")
     loop.add_argument("--window", help="unique substring of a visible window title; default: foreground window")
-    loop.add_argument("--text", help="exact text supplied by the user for one empty field")
+    loop.add_argument("--text", help="exact text supplied by the user for one field")
     loop.add_argument("--field", help="required field label substring for --text")
     loop.add_argument(
         "--fill", action="append", default=[], metavar="LABEL=TEXT", help="repeat for several exact field labels"
