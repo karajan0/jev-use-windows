@@ -88,7 +88,9 @@ See [INSTALL.md](INSTALL.md) for setup details and troubleshooting.
 
 Repeat `--click` for an ordered sequence. Each button is resolved when its turn
 arrives, so later buttons can appear in a new dialog. Supplied fields are handled
-first; missing or ambiguous targets stop the sequence.
+first. Missing buttons are re-observed for up to `--target-timeout` seconds
+(default: 3); ambiguous labels stop immediately. Waiting does not consume action
+steps or repeat earlier input.
 
 ### Supply exact text or a URL
 
@@ -157,7 +159,11 @@ and `--hold 'KEYS=MILLISECONDS'` supplies a bounded key hold. Holds accept
 | `run` | Execute an adaptive task or an explicit field/button workflow. |
 | `batch` | Click exact labels in a stable panel and verify the final result. |
 
-Use `--steps` to bound a run and `--observation-timeout` to limit each observation.
+Use `--steps` to bound a run and `--observation-timeout` to limit each observation
+and native UI Automation call. These calls share a reusable, isolated worker;
+a timeout terminates it and stops the task without replaying uncertain input.
+`--target-timeout` controls waiting for a missing explicit click target (0–60
+seconds). Each observation also has its own timeout.
 Run `.\jev.ps1 <command> --help` for command-specific options.
 
 ## Agent integration
@@ -224,6 +230,9 @@ flowchart LR
 Screenshots and reference-image matching stay local. Recognized text and action
 choices are sent to the selected model provider when model selection or
 verification is needed. Cached OCR and visual matching reuse unchanged content.
+Explicit target searches expand a truncated accessibility traversal from 350
+nodes / 5 levels to 2,000 nodes / 12 levels. If the expanded search is still
+truncated, the task stops instead of assuming a label is unique.
 Supported native fields use UI Automation value setting and exact readback;
 other fields use the normal keyboard input path.
 

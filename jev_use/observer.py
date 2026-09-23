@@ -1,4 +1,4 @@
-"""Reusable, killable observation process. No input actions run here."""
+"""Reusable, killable worker for observation and native UI Automation calls."""
 
 import multiprocessing
 import time
@@ -16,7 +16,20 @@ def _dispatch(operation, args, kwargs):
     from . import desktop, win32
 
     win32.enable_dpi_awareness()
-    functions = {"desktop": desktop.observe_desktop, "window": desktop.observe, "controls": desktop.observe_controls}
+    functions = {
+        "desktop": desktop.observe_desktop,
+        "window": desktop.observe,
+        "controls": desktop.observe_controls,
+        "target_matches": desktop.target_matches,
+        "invoke_target": desktop.invoke_target,
+        "set_target_value": desktop.set_target_value,
+        "read_focused_value": desktop.read_focused_value,
+    }
+    expected = kwargs.pop("_expected_window", None)
+    if expected is not None:
+        foreground = win32.select_window(None)
+        if foreground.handle != expected.handle or foreground.rect != expected.rect:
+            raise RuntimeError("Foreground window changed before native input; no input was sent")
     return {"value": functions[operation](*args, **kwargs)}
 
 
@@ -75,7 +88,10 @@ class Observer:
         try:
             self.connection.send((operation, args, kwargs))
             if not self.connection.poll(max(0, self.timeout - (time.monotonic() - started))):
-                raise TimeoutError(f"Observation exceeded {self.timeout:g}s; its worker was terminated")
+                raise TimeoutError(
+                    f"{operation} exceeded {self.timeout:g}s; worker terminated. "
+                    "Native input may already have been dispatched; do not resend automatically."
+                )
             success, result = self.connection.recv()
         except (TimeoutError, EOFError, BrokenPipeError, OSError):
             self.close(force=True)
@@ -141,5 +157,27 @@ def observe(window, **kwargs):
     return _call("window", window, **kwargs)
 
 
-def observe_controls(window):
-    return _call("controls", window)
+def observe_controls(window, **kwargs):
+    return _call("controls", window, **kwargs)
+
+
+def target_matches(target):
+    if target.role in {"OCR", "Visual"}:
+        return False
+    return _call("target_matches", target)
+
+
+def invoke_target(target, window=None):
+    if target.role not in {"ButtonControl", "HyperlinkControl", "MenuItemControl"}:
+        return False
+    return _call("invoke_target", target, _expected_window=window)
+
+
+def set_target_value(target, value, window=None):
+    if target.role not in {"EditControl", "ComboBoxControl"} or not target.runtime_id:
+        return None
+    return _call("set_target_value", target, value, _expected_window=window)
+
+
+def read_focused_value(target):
+    return _call("read_focused_value", target)

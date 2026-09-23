@@ -37,6 +37,9 @@ def parser() -> argparse.ArgumentParser:
     loop.add_argument("--expect-visible", help="exact completion text required outside editable fields")
     loop.add_argument("--expect-file", type=Path, help="output file that must be created or changed during this run")
     loop.add_argument("--ocr-language", help="installed Windows OCR language tag, such as en-US or ko")
+    loop.add_argument(
+        "--target-timeout", type=float, default=3.0, help="seconds to wait for a missing explicit click target"
+    )
     loop.add_argument("--steps", type=int, default=12)
     loop.add_argument("--min-confidence", type=float, default=0.35)
     loop.add_argument("--observation-timeout", type=float, default=5.0)
@@ -172,6 +175,7 @@ def execute(args: argparse.Namespace) -> dict | list[dict]:
             drags=_fills(args.drag),
             holds=_holds(args.hold),
             clicks=args.click,
+            target_timeout=args.target_timeout,
         )
     labels = args.label if args.label is not None else json.loads(args.labels)
     if (

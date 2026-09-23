@@ -157,7 +157,13 @@ def _visual_phrases(words: list[ocr.TextBox]) -> list[str]:
 
 @timed("uia")
 def _uia_targets(
-    handle: int, window_rect: tuple[int, int, int, int], *, cached: bool = True, proof: list[str] | None = None
+    handle: int,
+    window_rect: tuple[int, int, int, int],
+    *,
+    cached: bool = True,
+    proof: list[str] | None = None,
+    target_labels=(),
+    expanded=False,
 ) -> tuple[list[Target], list[str]]:
     import uiautomation as auto
     from comtypes import COMError
@@ -172,7 +178,10 @@ def _uia_targets(
     found: list[Target] = []
     text: list[str] = []
     seen = 0
-    while stack and seen < 350 and len(found) < 80:
+    limit, depth_limit = (2000, 12) if expanded else (350, 5)
+    truncated = False
+    proof_start = len(proof) if proof is not None else 0
+    while stack and seen < limit:
         control, depth, editable_ancestor = stack.pop()
         seen += 1
         try:
@@ -217,12 +226,21 @@ def _uia_targets(
                     found.append(
                         Target("text" if editable else "click", name or role, rect, role, value, focused, runtime_id)
                     )
-            if depth < 5:
-                child = control.GetFirstChildControl()
-                if child:
+            child = control.GetFirstChildControl()
+            if child:
+                if depth < depth_limit:
                     stack.append((child, depth + 1, editable_ancestor or role in TEXT_ROLES | {"ComboBoxControl"}))
+                else:
+                    truncated = True
         except (AttributeError, RuntimeError, OSError, COMError):
             continue
+    truncated = truncated or bool(stack)
+    if truncated and target_labels:
+        if expanded:
+            raise RuntimeError("Target search exceeded its tree budget; target uniqueness cannot be verified")
+        if proof is not None:
+            del proof[proof_start:]
+        return _uia_targets(handle, window_rect, cached=cached, proof=proof, target_labels=target_labels, expanded=True)
     return found, text
 
 
@@ -322,11 +340,11 @@ def invoke_target(target: Target) -> bool:
     return True
 
 
-def observe_controls(window: win32.Window) -> tuple[win32.Window, list[Target]]:
+def observe_controls(window: win32.Window, *, target_labels=()) -> tuple[win32.Window, list[Target]]:
     """Read stable UI Automation controls without paying for capture or OCR."""
     rect = win32.rect_of(window.handle)
     current = win32.Window(window.handle, window.title, rect)
-    targets, _ = _uia_targets(window.handle, rect)
+    targets, _ = _uia_targets(window.handle, rect, target_labels=target_labels)
     return current, targets
 
 
@@ -338,10 +356,11 @@ def _finish_observation(
     bounds: tuple[int, int, int, int],
     language: str | None,
     visual_targets: dict[str, str] | None = None,
+    target_labels=(),
 ) -> Observation:
     pending_ocr = _ocr_pool.submit(copy_context().run, _ocr_cache.read, ocr_image, window.handle, ocr_rect, language)
     uia_proof: list[str] = []
-    uia, names = _uia_targets(window.handle, window.rect, proof=uia_proof)
+    uia, names = _uia_targets(window.handle, window.rect, proof=uia_proof, target_labels=target_labels)
     words = pending_ocr.result()
     left, top = ocr_rect[:2]
 
@@ -395,7 +414,7 @@ def observe(window: win32.Window, *, language: str | None = None, visual_targets
 
 
 @timed("observation")
-def observe_desktop(*, language: str | None = None, visual_targets=None) -> Observation:
+def observe_desktop(*, language: str | None = None, visual_targets=None, target_labels=()) -> Observation:
     """Read pixels from the live desktop and controls from its current foreground window."""
     for _ in range(2):
         before = win32.select_window(None)
@@ -415,7 +434,7 @@ def observe_desktop(*, language: str | None = None, visual_targets=None) -> Obse
     else:
         raise RuntimeError("The foreground window changed during capture")
 
-    result = _finish_observation(foreground, image, image, bounds, bounds, language, visual_targets)
+    result = _finish_observation(foreground, image, image, bounds, bounds, language, visual_targets, target_labels)
     after = win32.select_window(None)
     if after.handle != foreground.handle or after.rect != foreground.rect:
         raise RuntimeError("The foreground window changed during observation; observe again")

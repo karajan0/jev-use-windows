@@ -15,16 +15,20 @@ from .credentials import Provider
 from .desktop import (
     Observation,
     Target,
-    invoke_target,
-    read_focused_value,
-    set_target_value,
-    target_matches,
     wait_for_update,
 )
 from .grounding import select_actions
 from .input_lock import exclusive
 from .metrics import measured_task, timed
-from .observer import isolated, observe_controls, observe_desktop
+from .observer import (
+    invoke_target,
+    isolated,
+    observe_controls,
+    observe_desktop,
+    read_focused_value,
+    set_target_value,
+    target_matches,
+)
 from .visual import action_state, reacquire, semantic_state, transition
 
 
@@ -134,7 +138,7 @@ def _direct_input(actions: dict[str, Action], field: str | None, fills: dict[str
     return None
 
 
-def _direct_click(actions, label):
+def _click_matches(actions, label):
     matches = [
         (key, action)
         for key, action in actions.items()
@@ -142,6 +146,11 @@ def _direct_click(actions, label):
     ]
     native = [(key, action) for key, action in matches if action.target.role not in {"OCR", "Visual"}]
     matches = native or matches
+    return matches
+
+
+def _direct_click(actions, label):
+    matches = _click_matches(actions, label)
     return matches[0][0] if len(matches) == 1 else None
 
 
@@ -282,11 +291,18 @@ def _perform(action: Action, screen: Observation) -> str:
             raise RuntimeError("No target for the selected action")
         _validate_target(action.target, screen)
         if action.kind == "type":
-            native = set_target_value(action.target, action.value or "")
+            native = set_target_value(action.target, action.value or "", screen.window)
             if native is not None:
                 return "field_readback" if native else "suspected_noop"
-        if action.kind == "click" and invoke_target(action.target):
+        if action.kind == "click" and invoke_target(action.target, screen.window):
             return "unverifiable"
+        # Native calls may have taken time. Recheck before coordinate fallback.
+        if (
+            win32.select_window(None).handle != screen.window.handle
+            or win32.rect_of(screen.window.handle) != screen.window.rect
+        ):
+            raise StaleTargetError("The window changed before coordinate input; no input was sent")
+        _validate_target(action.target, screen)
         win32.click(*action.target.center)
         if action.kind == "type":
             if action.target.value:
@@ -346,7 +362,10 @@ def run(
     drags: dict[str, str] | None = None,
     holds: dict[str, float] | None = None,
     clicks: list[str] | None = None,
+    target_timeout: float = 3.0,
 ) -> dict:
+    if not 0 <= target_timeout <= 60:
+        raise ValueError("Target timeout must be between 0 and 60 seconds")
     started = time.perf_counter()
     history: list[str] = []
     calls = 0
@@ -382,6 +401,12 @@ def run(
             "transitions": changes,
         }
 
+    def observe_current():
+        labels = [*supplied_fills, *pending_clicks, *supplied_drags, *supplied_drags.values()]
+        if field and text is not None:
+            labels.append(field)
+        return observe_desktop(language=language, visual_targets=visual_targets, target_labels=labels)
+
     def available_actions(screen: Observation) -> dict[str, Action]:
         return _actions(screen, text, field, supplied_fills, url, supplied_drags, supplied_holds)
 
@@ -410,7 +435,7 @@ def run(
             return failed(exc)
         for _step in range(max_steps):
             try:
-                screen = observe_desktop(language=language, visual_targets=visual_targets)
+                screen = observe_current()
                 current_window = screen.window
                 # Observe immediately after input. Wait only when no semantic
                 # transition is visible yet; fast UIs need no unconditional sleep.
@@ -421,7 +446,7 @@ def run(
                     and semantic_state(previous_screen) == semantic_state(screen)
                     and wait_for_update(screen, timeout=max(delay, 0.3))
                 ):
-                    screen = observe_desktop(language=language, visual_targets=visual_targets)
+                    screen = observe_current()
                     current_window = screen.window
                 if prior is not None and history and history[-1].endswith("[unverifiable]"):
                     change = transition(previous_screen, screen, previous_target)
@@ -459,9 +484,24 @@ def run(
                             "Supplied fields are not visible or uniquely resolved before the click sequence",
                         )
                         break
-                    direct_click = _direct_click(actions, pending_clicks[0])
+                    deadline = time.monotonic() + target_timeout
+                    while True:
+                        matches = _click_matches(actions, pending_clicks[0])
+                        if matches or time.monotonic() >= deadline:
+                            break
+                        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                        screen = observe_current()
+                        current_window = screen.window
+                        verify(screen)  # Track disappearance of pre-existing completion text.
+                        actions = available_actions(screen)
+                    direct_click = matches[0][0] if len(matches) == 1 else None
                     if direct_click is None:
-                        status, reason = "uncertain", "The next explicit click label is missing or ambiguous"
+                        status = "uncertain"
+                        reason = (
+                            "The next explicit click label is ambiguous"
+                            if matches
+                            else "Timed out waiting for the next explicit click label"
+                        )
                         break
                     direct = direct_click
                 if direct:
@@ -471,7 +511,7 @@ def run(
                     choice, confidence, proof = _choose(client, goal, screen, actions, history)
                 if confidence < min_confidence:
                     time.sleep(0.18)
-                    refreshed = observe_desktop(language=language, visual_targets=visual_targets)
+                    refreshed = observe_current()
                     if _snapshot_id(refreshed) != _snapshot_id(screen):
                         screen = refreshed
                         current_window = screen.window
@@ -479,7 +519,7 @@ def run(
                         choice, confidence, proof = _choose(client, goal, screen, actions, history)
                         calls += 1
                 if choice == "none":
-                    refreshed = observe_desktop(language=language, visual_targets=visual_targets)
+                    refreshed = observe_current()
                     screen = refreshed
                     current_window = screen.window
                     actions = available_actions(screen)
@@ -516,7 +556,7 @@ def run(
                 except StaleTargetError:
                     if action.target is None:
                         raise
-                    refreshed = observe_desktop(language=language, visual_targets=visual_targets)
+                    refreshed = observe_current()
                     tracked = reacquire(action.target, screen, refreshed)
                     if tracked is None:
                         raise StaleTargetError(
@@ -582,7 +622,7 @@ def run(
             status = "step_limit"
             if expected_visible or expected_file:
                 try:
-                    final = observe_desktop(language=language, visual_targets=visual_targets)
+                    final = observe_current()
                     current_window = final.window
                     verified, deterministic_evidence = verify(final)
                     if verified:
@@ -618,7 +658,7 @@ def batch(
 ) -> dict:
     """Map exact labels once, then execute a stable visible panel with one Jev verification call."""
     started = time.perf_counter()
-    current, controls = observe_controls(window)
+    current, controls = observe_controls(window, target_labels=labels)
     mapped: list[Target] = []
     for label in labels:
         matches = [item for item in controls if item.kind == "click" and item.label.casefold() == label.casefold()]
@@ -642,9 +682,12 @@ def batch(
         try:
             if not target_matches(target):
                 raise RuntimeError("The batch target changed; observe again before continuing")
-            if not invoke_target(target):
+            if not invoke_target(target, current):
                 if not target_matches(target):
                     raise RuntimeError("The batch target changed before coordinate input")
+                foreground = win32.select_window(None)
+                if foreground.handle != current.handle or foreground.rect != current.rect:
+                    raise RuntimeError("The foreground window changed before batch coordinate input")
                 win32.click(*target.center)
         except Exception as exc:
             return {"status": "uncertain", "error": str(exc), "clicked": clicked, "attempted": label}

@@ -60,7 +60,7 @@ class CachedControl:
         return CachedControl(children.GetElement(0), self.walker, self.request, self.auto, siblings=children)
 
     def GetNextSiblingControl(self):
-        if self.siblings is None or self.index + 1 >= min(350, self.siblings.Length):
+        if self.siblings is None or self.index + 1 >= self.siblings.Length:
             return None
         index = self.index + 1
         return CachedControl(
