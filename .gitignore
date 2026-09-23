@@ -6,4 +6,5 @@ config/
 runs/
 *.pyc
 .pytest_cache/
-benchmarks/*.log
+benchmarks/
+UPGRADE.md
