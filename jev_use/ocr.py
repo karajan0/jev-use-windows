@@ -3,9 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import local
 
 from PIL import Image
+
+from .metrics import timed
+
+_worker = local()
+
+
+def _tile_read(image, language):
+    """Bounded, thread-owned exact-pixel cache; no screenshots are retained."""
+    if not hasattr(_worker, "tiles"):
+        _worker.tiles = OrderedDict()
+    key = (image.size, image.mode, language, hashlib.blake2s(image.tobytes()).digest())
+    cached = _worker.tiles.get(key)
+    if cached is not None:
+        _worker.tiles.move_to_end(key)
+        return cached
+    enlarged = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+    words = _worker.runner.run(_read(enlarged, language))
+    _worker.tiles[key] = words
+    if len(_worker.tiles) > 64:
+        _worker.tiles.popitem(last=False)
+    return words
 
 
 @dataclass(frozen=True)
@@ -21,12 +45,14 @@ def available_languages() -> list[str]:
     return [item.language_tag for item in OcrEngine.available_recognizer_languages]
 
 
-async def _read(image: Image.Image, language: str | None) -> list[TextBox]:
+def _engine(language: str | None):
     from winrt.windows.globalization import Language
-    from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.media.ocr import OcrEngine
-    from winrt.windows.storage.streams import DataWriter
 
+    if not hasattr(_worker, "engines"):
+        _worker.engines = {}
+    if language in _worker.engines:
+        return _worker.engines[language]
     engine = (
         OcrEngine.try_create_from_language(Language(language))
         if language
@@ -34,6 +60,15 @@ async def _read(image: Image.Image, language: str | None) -> list[TextBox]:
     )
     if engine is None:
         raise RuntimeError("Windows OCR has no usable language pack")
+    _worker.engines[language] = engine
+    return engine
+
+
+async def _read(image: Image.Image, language: str | None) -> list[TextBox]:
+    from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
+    from winrt.windows.storage.streams import DataWriter
+
+    engine = _engine(language)
     image = image.convert("RGBA")
     scale = min(1.0, 1800 / max(image.size))
     if scale < 1:
@@ -57,5 +92,37 @@ async def _read(image: Image.Image, language: str | None) -> list[TextBox]:
     return boxes
 
 
+@timed("ocr")
 def read(image: Image.Image, language: str | None = None) -> list[TextBox]:
-    return asyncio.run(_read(image, language))
+    if not hasattr(_worker, "runner"):
+        _worker.runner = asyncio.Runner()
+    if max(image.size) <= 1800:
+        return _worker.runner.run(_read(image, language))
+    # Preserve tiny UI lettering. Overlapping tiles are enlarged for OCR, never
+    # shrunk as a whole desktop; each word belongs to exactly one tile core.
+    words = []
+    core, margin, magnification = 768, 48, 2
+    for top in range(0, image.height, core):
+        for left in range(0, image.width, core):
+            x, y = max(0, left - margin), max(0, top - margin)
+            right, bottom = min(image.width, left + core + margin), min(image.height, top + core + margin)
+            crop = image.crop((x, y, right, bottom))
+            for word in _tile_read(crop, language):
+                rect = tuple(
+                    round(value / magnification) + (x if index % 2 == 0 else y) for index, value in enumerate(word.rect)
+                )
+                cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+                if left <= cx < min(left + core, image.width) and top <= cy < min(top + core, image.height):
+                    words.append(TextBox(word.text, rect, word.line))
+    return sorted(words, key=lambda word: (word.rect[1], word.rect[0]))
+
+
+def close_worker() -> None:
+    """Release resources on the same thread that created the OCR engine."""
+    if hasattr(_worker, "runner"):
+        _worker.runner.close()
+        del _worker.runner
+    if hasattr(_worker, "engines"):
+        del _worker.engines
+    if hasattr(_worker, "tiles"):
+        del _worker.tiles

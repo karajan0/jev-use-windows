@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass, field
 
 from PIL import Image, ImageChops
 
 from . import ocr, win32
+from .metrics import timed
 
 CLICK_ROLES = {
     "ButtonControl",
@@ -88,6 +91,8 @@ class Target:
     role: str
     value: str = ""
     focused: bool = False
+    runtime_id: tuple[int, ...] = ()
+    context: str = ""
 
     @property
     def center(self) -> tuple[int, int]:
@@ -150,26 +155,25 @@ def _visual_phrases(words: list[ocr.TextBox]) -> list[str]:
     return list(dict.fromkeys(phrases))
 
 
-def _uia_targets(handle: int, window_rect: tuple[int, int, int, int]) -> tuple[list[Target], list[str]]:
+@timed("uia")
+def _uia_targets(
+    handle: int, window_rect: tuple[int, int, int, int], *, cached: bool = True, proof: list[str] | None = None
+) -> tuple[list[Target], list[str]]:
     import uiautomation as auto
     from comtypes import COMError
 
-    root = auto.ControlFromHandle(handle)
-    stack = [(root, 0)]
+    from . import uia_cache
+
+    try:
+        root = uia_cache.root(handle) if cached else auto.ControlFromHandle(handle)
+    except (AttributeError, RuntimeError, OSError, COMError):
+        root = auto.ControlFromHandle(handle)
+    stack = [(root, 0, False)]
     found: list[Target] = []
     text: list[str] = []
     seen = 0
-    focused_point: tuple[int, int] | None = None
-    with suppress(AttributeError, RuntimeError, OSError, COMError):
-        focused_control = auto.GetFocusedControl()
-        if focused_control is not None:
-            focus_box = focused_control.BoundingRectangle
-            focused_point = (
-                (int(focus_box.left) + int(focus_box.right)) // 2,
-                (int(focus_box.top) + int(focus_box.bottom)) // 2,
-            )
     while stack and seen < 350 and len(found) < 80:
-        control, depth = stack.pop()
+        control, depth, editable_ancestor = stack.pop()
         seen += 1
         try:
             # Schedule the sibling first, then the child, to keep depth-first
@@ -177,11 +181,21 @@ def _uia_targets(handle: int, window_rect: tuple[int, int, int, int]) -> tuple[l
             if depth:
                 sibling = control.GetNextSiblingControl()
                 if sibling:
-                    stack.append((sibling, depth))
+                    stack.append((sibling, depth, editable_ancestor))
             role = str(control.ControlTypeName)
             name = str(control.Name or "").strip()[:160]
             if name and name not in text and len(text) < 120:
                 text.append(name)
+            if (
+                proof is not None
+                and name
+                and not editable_ancestor
+                and role in {"TextControl", "StatusBarControl"}
+                and not control.IsOffscreen
+            ):
+                box = control.BoundingRectangle
+                if _inside((int(box.left), int(box.top), int(box.right), int(box.bottom)), window_rect):
+                    proof.append(name)
             if role in CLICK_ROLES | TEXT_ROLES and not control.IsOffscreen and control.IsEnabled:
                 box = control.BoundingRectangle
                 rect = (int(box.left), int(box.top), int(box.right), int(box.bottom))
@@ -198,16 +212,15 @@ def _uia_targets(handle: int, window_rect: tuple[int, int, int, int]) -> tuple[l
                                 editable = not pattern.IsReadOnly
                         if value and len(text) < 120:
                             text.append(f"{name or role}: {value}")
-                    focused = bool(
-                        focused_point
-                        and rect[0] <= focused_point[0] < rect[2]
-                        and rect[1] <= focused_point[1] < rect[3]
+                    focused = bool(control.HasKeyboardFocus)
+                    runtime_id = tuple(control.GetRuntimeId())
+                    found.append(
+                        Target("text" if editable else "click", name or role, rect, role, value, focused, runtime_id)
                     )
-                    found.append(Target("text" if editable else "click", name or role, rect, role, value, focused))
             if depth < 5:
                 child = control.GetFirstChildControl()
                 if child:
-                    stack.append((child, depth + 1))
+                    stack.append((child, depth + 1, editable_ancestor or role in TEXT_ROLES | {"ComboBoxControl"}))
         except (AttributeError, RuntimeError, OSError, COMError):
             continue
     return found, text
@@ -232,7 +245,7 @@ def read_focused_value(target: Target) -> str | None:
 
 def _matching_control(target: Target):
     """Resolve a live UI Automation element at the observed target point."""
-    if target.role == "OCR":
+    if target.role in {"OCR", "Visual"}:
         return None
     import uiautomation as auto
     from comtypes import COMError
@@ -243,6 +256,12 @@ def _matching_control(target: Target):
             if control is None:
                 return None
             if control.ControlTypeName == target.role and str(control.Name or "").strip()[:160] == target.label:
+                box = control.BoundingRectangle
+                rect = (int(box.left), int(box.top), int(box.right), int(box.bottom))
+                if rect != target.rect or control.IsOffscreen or not control.IsEnabled:
+                    return None
+                if target.runtime_id and tuple(control.GetRuntimeId()) != target.runtime_id:
+                    return None
                 return control
             control = control.GetParentControl()
     except (AttributeError, RuntimeError, OSError, COMError):
@@ -252,6 +271,35 @@ def _matching_control(target: Target):
 
 def target_matches(target: Target) -> bool:
     return _matching_control(target) is not None
+
+
+@timed("native_text")
+def set_target_value(target: Target, value: str) -> bool | None:
+    """Use a native writable value provider; never retry a dispatched failure."""
+    if target.role not in {"EditControl", "ComboBoxControl"} or not target.runtime_id:
+        return None
+    control = _matching_control(target)
+    if control is None:
+        return None
+    if control.IsPassword:
+        raise RuntimeError("The field became a protected input")
+    try:
+        pattern = control.GetValuePattern()
+        if pattern is None:
+            return None
+        if pattern.IsReadOnly:
+            raise ValueError("The field is read-only")
+    except AttributeError:
+        return None
+    if not pattern.SetValue(value, waitTime=0):
+        raise RuntimeError("Native text input was dispatched but could not be confirmed")
+    deadline = time.monotonic() + 0.4
+    while True:
+        if str(pattern.Value or "") == value:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
 
 
 def invoke_target(target: Target) -> bool:
@@ -289,9 +337,11 @@ def _finish_observation(
     ocr_rect: tuple[int, int, int, int],
     bounds: tuple[int, int, int, int],
     language: str | None,
+    visual_targets: dict[str, str] | None = None,
 ) -> Observation:
-    pending_ocr = _ocr_pool.submit(_ocr_cache.read, ocr_image, window.handle, ocr_rect, language)
-    uia, names = _uia_targets(window.handle, window.rect)
+    pending_ocr = _ocr_pool.submit(copy_context().run, _ocr_cache.read, ocr_image, window.handle, ocr_rect, language)
+    uia_proof: list[str] = []
+    uia, names = _uia_targets(window.handle, window.rect, proof=uia_proof)
     words = pending_ocr.result()
     left, top = ocr_rect[:2]
 
@@ -303,10 +353,25 @@ def _finish_observation(
     uncovered = [word for word in words if not covered(word)]
     covered_words = [word for word in words if covered(word)]
     targets = list(uia)
-    for word in [*uncovered, *covered_words][:70]:
+    if visual_targets:
+        from .visual import locate_targets
+
+        targets.extend(locate_targets(ocr_image, ocr_rect, visual_targets))
+    for word in [*uncovered, *covered_words]:
         box = (left + word.rect[0], top + word.rect[1], left + word.rect[2], top + word.rect[3])
         if _inside(box, window.rect):
-            targets.append(Target("click", word.text, box, "OCR"))
+            context = word.line
+            if len(word.text) <= 2:
+                from .grounding import spatial_context
+
+                context = spatial_context(word.rect, words) or context
+            targets.append(Target("click", word.text, box, "OCR", context=context))
+    # Dense custom-drawn windows may expose no native controls. Retain geometry
+    # and neighboring labels for small non-text controls instead of dropping them.
+    if len(uia) < 8 and words:
+        from .grounding import visual_controls
+
+        targets.extend(visual_controls(ocr_image, words, ocr_rect))
     lines = list(dict.fromkeys(word.line or word.text for word in [*uncovered, *covered_words]))
     text = list(dict.fromkeys([window.title, *names, *lines]))[:150]
     editable = [target.rect for target in uia if target.kind == "text"]
@@ -316,35 +381,78 @@ def _finish_observation(
         y = top + (word.rect[1] + word.rect[3]) // 2
         return any(rect[0] <= x < rect[2] and rect[1] <= y < rect[3] for rect in editable)
 
-    postcondition_text = _visual_phrases([word for word in words if not in_edit(word)])[:150]
-    return Observation(window, image, targets[:140], text, lines, bounds, postcondition_text)
+    postcondition_text = list(
+        dict.fromkeys([*uia_proof, *_visual_phrases([word for word in words if not in_edit(word)])])
+    )[:150]
+    return Observation(window, image, targets, text, lines, bounds, postcondition_text)
 
 
-def observe(window: win32.Window, *, language: str | None = None) -> Observation:
+def observe(window: win32.Window, *, language: str | None = None, visual_targets=None) -> Observation:
     rect = win32.rect_of(window.handle)
     current = win32.Window(window.handle, window.title, rect)
     image = win32.capture_window(window.handle, rect)
-    return _finish_observation(current, image, image, rect, rect, language)
+    return _finish_observation(current, image, image, rect, rect, language, visual_targets)
 
 
-def observe_desktop(*, language: str | None = None) -> Observation:
+@timed("observation")
+def observe_desktop(*, language: str | None = None, visual_targets=None) -> Observation:
     """Read pixels from the live desktop and controls from its current foreground window."""
     for _ in range(2):
         before = win32.select_window(None)
-        bounds, image = win32.capture_desktop()
+        desktop = win32.desktop_bounds()
+        bounds = (
+            max(desktop[0], before.rect[0]),
+            max(desktop[1], before.rect[1]),
+            min(desktop[2], before.rect[2]),
+            min(desktop[3], before.rect[3]),
+        )
+        if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            raise RuntimeError("The foreground window is outside the desktop")
+        image = win32.capture_region(bounds)
         foreground = win32.select_window(None)
-        if before.handle == foreground.handle:
+        if before.handle == foreground.handle and before.rect == foreground.rect:
             break
     else:
         raise RuntimeError("The foreground window changed during capture")
 
-    crop = (
-        max(bounds[0], foreground.rect[0]),
-        max(bounds[1], foreground.rect[1]),
-        min(bounds[2], foreground.rect[2]),
-        min(bounds[3], foreground.rect[3]),
-    )
-    if crop[2] <= crop[0] or crop[3] <= crop[1]:
-        raise RuntimeError("The foreground window is outside the desktop")
-    foreground_image = image.crop((crop[0] - bounds[0], crop[1] - bounds[1], crop[2] - bounds[0], crop[3] - bounds[1]))
-    return _finish_observation(foreground, image, foreground_image, crop, bounds, language)
+    result = _finish_observation(foreground, image, image, bounds, bounds, language, visual_targets)
+    after = win32.select_window(None)
+    if after.handle != foreground.handle or after.rect != foreground.rect:
+        raise RuntimeError("The foreground window changed during observation; observe again")
+    return result
+
+
+@timed("settle")
+def wait_for_update(screen: Observation, timeout: float = 0.3, poll: float = 0.025, region=None) -> bool:
+    """Wait cheaply for changed pixels or foreground; no OCR or model calls."""
+    deadline = time.monotonic() + timeout
+    bounds = screen.bounds or screen.window.rect
+    reference = screen.image
+    if region:
+        bounds = (
+            max(bounds[0], region[0] - 24),
+            max(bounds[1], region[1] - 24),
+            min(bounds[2], region[2] + 24),
+            min(bounds[3], region[3] + 24),
+        )
+        origin = screen.bounds or screen.window.rect
+        reference = screen.image.crop(tuple(value - origin[index % 2] for index, value in enumerate(bounds)))
+    previous = None
+    while True:
+        current = win32.select_window(None)
+        if current.handle != screen.window.handle or current.rect != screen.window.rect:
+            return True
+        image = win32.capture_region(bounds)
+        if image.size != reference.size or ImageChops.difference(image, reference).getbbox():
+            if region is None:
+                return True
+            from .visual import changed_fraction
+
+            if changed_fraction(reference, image) >= 0.02:
+                if previous is not None and changed_fraction(previous, image) < 0.01:
+                    return True
+                previous = image
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(poll, remaining))

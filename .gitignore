@@ -5,3 +5,5 @@ dist/
 config/
 runs/
 *.pyc
+.pytest_cache/
+benchmarks/*.log

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import ocr, win32
 from .credentials import Provider, load
-from .desktop import observe
+from .observer import Observer
 from .runner import batch, run
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +23,8 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("windows", help="list visible top-level windows")
     inspect = sub.add_parser("inspect", help="read one window's local text and targets without an API request")
     inspect.add_argument("--window", help="unique title substring or #window-handle; default: foreground window")
+    inspect.add_argument("--observation-timeout", type=float, default=5.0)
+    inspect.add_argument("--visual-target", action="append", default=[], metavar="LABEL=IMAGE")
     loop = sub.add_parser("run", help="let Jev observe and act until the goal is verified or the limit is reached")
     loop.add_argument("goal")
     loop.add_argument("--window", help="unique substring of a visible window title; default: foreground window")
@@ -37,10 +39,24 @@ def parser() -> argparse.ArgumentParser:
     loop.add_argument("--ocr-language", help="installed Windows OCR language tag, such as en-US or ko")
     loop.add_argument("--steps", type=int, default=12)
     loop.add_argument("--min-confidence", type=float, default=0.35)
+    loop.add_argument("--observation-timeout", type=float, default=5.0)
+    loop.add_argument("--visual-target", action="append", default=[], metavar="LABEL=IMAGE")
+    loop.add_argument("--drag", action="append", default=[], metavar="SOURCE=DESTINATION")
+    loop.add_argument("--hold", action="append", default=[], metavar="KEYS=MILLISECONDS")
+    loop.add_argument(
+        "--click",
+        action="append",
+        default=[],
+        metavar="EXACT_LABEL",
+        help="after supplied fields, click these exact labels in order with live validation",
+    )
     stable = sub.add_parser("batch", help="click exact labels in a stable panel, then verify once with Jev")
     stable.add_argument("goal")
     stable.add_argument("--window", required=True)
-    stable.add_argument("--label", action="append", required=True)
+    labels = stable.add_mutually_exclusive_group(required=True)
+    labels.add_argument("--label", action="append")
+    labels.add_argument("--labels", help='JSON array of exact labels, e.g. ["Apply", "Save"]')
+    stable.add_argument("--observation-timeout", type=float, default=5.0)
     stable.add_argument("--dry-run", action="store_true")
     return command
 
@@ -58,12 +74,43 @@ def _fills(entries: list[str]) -> dict[str, str]:
     return result
 
 
+def _visual_targets(entries: list[str]) -> dict[str, str]:
+    from .visual import load_template
+
+    if len(entries) > 16:
+        raise ValueError("At most 16 visual target references are supported")
+    result = _fills(entries)
+    for label, path in result.items():
+        resolved = Path(path).resolve(strict=True)
+        load_template(resolved)
+        result[label] = str(resolved)
+    return result
+
+
+def _holds(entries):
+    from .gestures import key_codes
+
+    result = {}
+    for chord, milliseconds in _fills(entries).items():
+        key_codes(chord)
+        seconds = float(milliseconds) / 1000
+        if not 0.01 <= seconds <= 2.0:
+            raise ValueError("Hold duration must be 10 to 2000 milliseconds")
+        result[chord] = seconds
+    return result
+
+
 def execute(args: argparse.Namespace) -> dict | list[dict]:
     win32.enable_dpi_awareness()
     if args.command == "windows":
         return [asdict(item) for item in win32.windows()]
     if args.command == "inspect":
-        screen = observe(win32.select_window(args.window))
+        references = _visual_targets(args.visual_target)
+        worker = Observer(args.observation_timeout)
+        try:
+            screen = worker.call("window", win32.select_window(args.window), visual_targets=references)
+        finally:
+            worker.close()
         return {
             "status": "observed",
             "window": asdict(screen.window),
@@ -105,6 +152,8 @@ def execute(args: argparse.Namespace) -> dict | list[dict]:
             raise ValueError("--expect-visible requires nonempty text")
         if args.expect_file is not None and not args.expect_file.is_absolute():
             raise ValueError("--expect-file requires an absolute path")
+        if any(not label.strip() for label in args.click):
+            raise ValueError("--click requires nonempty exact labels")
         return run(
             args.goal,
             win32.select_window(args.window),
@@ -118,11 +167,29 @@ def execute(args: argparse.Namespace) -> dict | list[dict]:
             min_confidence=args.min_confidence,
             expected_visible=args.expect_visible,
             expected_file=args.expect_file,
+            observation_timeout=args.observation_timeout,
+            visual_targets=_visual_targets(args.visual_target),
+            drags=_fills(args.drag),
+            holds=_holds(args.hold),
+            clicks=args.click,
         )
-    if not args.goal.strip() or not args.label or any(not item.strip() for item in args.label):
+    labels = args.label if args.label is not None else json.loads(args.labels)
+    if (
+        not args.goal.strip()
+        or not isinstance(labels, list)
+        or not labels
+        or any(not isinstance(item, str) or not item.strip() for item in labels)
+    ):
         raise ValueError("A goal and nonempty labels are required")
     provider = Provider("") if args.dry_run else load(ROOT)
-    return batch(args.goal, win32.select_window(args.window), provider, args.label, dry_run=args.dry_run)
+    return batch(
+        args.goal,
+        win32.select_window(args.window),
+        provider,
+        labels,
+        dry_run=args.dry_run,
+        observation_timeout=args.observation_timeout,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,10 +202,10 @@ def main(argv: list[str] | None = None) -> int:
             else 1
         )
     except KeyboardInterrupt:
-        print(json.dumps({"status": "stopped", "error": "Interrupted by the user"}))
+        print(json.dumps({"status": "stopped", "goal_achieved": False, "error": "Interrupted by the user"}))
         return 130
     except Exception as exc:
-        print(json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"status": "failed", "goal_achieved": False, "error": str(exc)}, ensure_ascii=False))
         return 1
 
 

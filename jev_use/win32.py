@@ -12,6 +12,8 @@ from functools import lru_cache
 
 from PIL import Image, ImageGrab
 
+from .metrics import timed
+
 
 @dataclass(frozen=True)
 class Window:
@@ -26,6 +28,8 @@ def _user32():
         raise RuntimeError("An interactive Windows desktop is required")
     api = ctypes.windll.user32
     api.GetForegroundWindow.restype = wintypes.HWND
+    api.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    api.GetAncestor.restype = wintypes.HWND
     api.SetForegroundWindow.argtypes = [wintypes.HWND]
     api.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     api.IsWindowVisible.argtypes = [wintypes.HWND]
@@ -38,6 +42,8 @@ def _user32():
     api.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
     api.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     api.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+    api.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    api.GetAsyncKeyState.restype = ctypes.c_short
     return api
 
 
@@ -59,6 +65,18 @@ def _gdi32():
     api.SelectObject.restype = ctypes.c_void_p
     api.DeleteObject.argtypes = [ctypes.c_void_p]
     api.DeleteDC.argtypes = [wintypes.HDC]
+    api.BitBlt.argtypes = [
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.HDC,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.DWORD,
+    ]
+    api.BitBlt.restype = wintypes.BOOL
     return api
 
 
@@ -102,8 +120,8 @@ def rect_of(handle: int) -> tuple[int, int, int, int]:
     return bounds
 
 
-def capture_window(handle: int, rect: tuple[int, int, int, int]) -> Image.Image:
-    """Capture one window through GDI, including a window on a secondary display."""
+def _capture_gdi(handle: int | None, rect: tuple[int, int, int, int]) -> Image.Image:
+    """Render a window or copy exactly one live desktop region into a DIB."""
     width, height = rect[2] - rect[0], rect[3] - rect[1]
     if width > 6000 or height > 6000:
         raise RuntimeError("The selected window is too large to capture")
@@ -125,7 +143,10 @@ def capture_window(handle: int, rect: tuple[int, int, int, int]) -> Image.Image:
                 raise RuntimeError("Could not allocate a window capture buffer")
             previous = gdi32.SelectObject(memory_dc, bitmap)
             try:
-                if not user32.PrintWindow(wintypes.HWND(handle), memory_dc, 2) and not user32.PrintWindow(
+                if handle is None:
+                    if not gdi32.BitBlt(memory_dc, 0, 0, width, height, screen_dc, rect[0], rect[1], 0x40CC0020):
+                        raise RuntimeError("The desktop region could not be captured")
+                elif not user32.PrintWindow(wintypes.HWND(handle), memory_dc, 2) and not user32.PrintWindow(
                     wintypes.HWND(handle), memory_dc, 0
                 ):
                     raise RuntimeError("The selected window did not render a capture")
@@ -139,6 +160,10 @@ def capture_window(handle: int, rect: tuple[int, int, int, int]) -> Image.Image:
             gdi32.DeleteDC(memory_dc)
     finally:
         user32.ReleaseDC(None, screen_dc)
+
+
+def capture_window(handle: int, rect: tuple[int, int, int, int]) -> Image.Image:
+    return _capture_gdi(handle, rect)
 
 
 def windows() -> list[Window]:
@@ -191,6 +216,7 @@ def desktop_bounds() -> tuple[int, int, int, int]:
     )
 
 
+@timed("capture")
 def capture_desktop() -> tuple[tuple[int, int, int, int], Image.Image]:
     """Capture the pixels actually visible across the virtual desktop."""
     bounds = desktop_bounds()
@@ -200,14 +226,31 @@ def capture_desktop() -> tuple[tuple[int, int, int, int], Image.Image]:
     return bounds, image
 
 
+@timed("capture")
 def capture_region(rect: tuple[int, int, int, int]) -> Image.Image:
     """Read a small live desktop region just before an action."""
     if rect[2] <= rect[0] or rect[3] <= rect[1]:
         raise ValueError("The capture region is empty")
-    return ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB")
+    return _capture_gdi(None, rect)
 
 
 def select_window(query: str | None) -> Window:
+    if not query:
+        user32 = _user32()
+        active = int(user32.GetForegroundWindow() or 0)
+        handles = [active]
+        for ancestor in (2, 3):
+            handles.append(int(user32.GetAncestor(active, ancestor) or 0))
+        for handle in dict.fromkeys(handles):
+            if not handle or not user32.IsWindowVisible(handle) or user32.IsIconic(handle):
+                continue
+            length = user32.GetWindowTextLengthW(handle)
+            if not length:
+                continue
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(handle, buffer, length + 1)
+            return Window(handle, buffer.value, rect_of(handle))
+        raise RuntimeError("No visible foreground window; use --window")
     listed = windows()
     if query:
         if query.startswith("#"):
@@ -223,17 +266,6 @@ def select_window(query: str | None) -> Window:
         if len(matches) != 1:
             raise ValueError(f"Window query matched {len(matches)} visible windows; use a unique title")
         return matches[0]
-    active = int(_user32().GetForegroundWindow())
-    for item in listed:
-        if item.handle == active:
-            return item
-    # Native menus can take focus through a titleless child window.
-    for ancestor in (2, 3):  # GA_ROOT, GA_ROOTOWNER
-        root = int(_user32().GetAncestor(wintypes.HWND(active), ancestor) or 0)
-        for item in listed:
-            if item.handle == root:
-                return item
-    raise RuntimeError("No visible foreground window; use --window")
 
 
 def activate(handle: int) -> None:

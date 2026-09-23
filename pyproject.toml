@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "typesafe-sdk==0.6.0",
     "pillow==12.3.0",
+    "opencv-python-headless==5.0.0.93",
     "uiautomation==2.0.29; sys_platform == 'win32'",
     "winrt-Windows.Media.Ocr==3.2.1; sys_platform == 'win32'",
     "winrt-Windows.Graphics.Imaging==3.2.1; sys_platform == 'win32'",
@@ -43,6 +44,10 @@ packages = ["jev_use"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+extend-exclude = ["runs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]

@@ -5,6 +5,24 @@ A PowerShell-first Windows desktop control tool for AI agents, powered by
 the current foreground window through OCR and UI Automation, performs mouse
 and keyboard actions, and returns the result as JSON.
 
+## Fast explicit workflows
+
+Use exact supplied field names and button labels to avoid model selection for
+known workflows. Native fields that are already visible are filled together,
+with live identity checks and exact value readback for every field. Buttons are
+resolved and verified again when their turn arrives, including newly opened dialogs.
+
+```powershell
+jev.cmd run 'Fill the form and save' --window 'My Form' `
+  --fill 'Name=Example' --fill 'City=Seoul' `
+  --click 'Save' --expect-visible 'Saved successfully'
+```
+
+Repeat `--click` for an ordered sequence after the supplied fields. Missing or
+ambiguous labels stop the sequence. Native value providers avoid clipboard races;
+unsupported fields keep the normal input path. Completion is still verified.
+See [measured performance and limitations](benchmarks/SPEED_REPORT.md).
+
 ## Requirements
 
 - Windows 10 or Windows 11
@@ -255,8 +273,11 @@ not provide reliably.
 
 ## Development
 
+See [UPGRADE.md](UPGRADE.md) for local runtime changes, measured results and limitations.
+
 ```powershell
-python -m pip install -e . ruff
+python -m pip install -e . ruff pytest
+python -m pytest -q
 python -m ruff check .
 python -m ruff format --check .
 ```
